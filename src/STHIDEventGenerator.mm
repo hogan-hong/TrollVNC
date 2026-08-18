@@ -540,10 +540,10 @@ static InterpolationType interpolationFromString(NSString *string) {
 }
 
 // === HID 诊断日志 ===
-// 日志路径: /var/trollvnc-hid.log
+// 日志路径: /tmp/trollvnc-hid.log
 // 记录 IOHIDEventSystemClientCreate 返回值和 DispatchEvent 执行情况
 // 用于诊断无屏冷启动时触控失效问题
-static NSString *const kHIDLogPath = @"/var/trollvnc-hid.log";
+static NSString *const kHIDLogPath = @"/tmp/trollvnc-hid.log";
 static const NSUInteger kHIDLogMaxSize = 2 * 1024 * 1024; // 2MB 上限
 
 static void _hidLog(NSString *message) {
