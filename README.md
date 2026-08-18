@@ -648,6 +648,78 @@ For advanced tuning (HTTP/TLS, wheel tuning, dirty detection, etc.), commit your
 - Download them from the run page → `Artifacts`.
 - If you push to the `release` branch (and the workflow runs there), a GitHub Release is created automatically with packaged files attached.
 
+## HTTP API 接口
+
+TrollVNC 内置 HTTP API 服务器，默认监听端口 `5802`（可通过 preferences plist 中 `ApiPort` 字段配置，`0` 为关闭）。所有接口仅支持 GET 方法，返回 JSON 格式。
+
+### 接口列表
+
+#### `GET /api/health`
+
+健康检查。
+
+**返回：**
+```json
+{"ok": true, "status": "running"}
+```
+
+#### `GET /api/assistivetouch`
+
+开启或关闭辅助触控（AssistiveTouch）。通过 Preferences.framework 的 `PSAssistiveTouchSettingsDetail` 系统API 直接调用。
+
+**参数：**
+- `enable`（可选）: `true` 开启（默认），`false` 关闭
+
+**示例：**
+```
+GET /api/assistivetouch?enable=true
+GET /api/assistivetouch?enable=false
+```
+
+**返回：**
+```json
+{"ok": true, "action": "enable", "feature": "AssistiveTouch"}
+```
+
+#### `GET /api/guidedaccess/exit`
+
+退出引导访问（Guided Access）。三击 Home 键调出退出界面，用户手动输入密码。
+
+**示例：**
+```
+GET /api/guidedaccess/exit
+```
+
+**返回：**
+```json
+{"ok": true, "action": "exit_guided_access"}
+```
+
+#### `GET /api/home`
+
+模拟 Home 键按键。
+
+**参数：**
+- `count`（可选）: 按键次数，`1`=单击（默认），`2`=双击，`3`及以上=三击
+
+**示例：**
+```
+GET /api/home?count=1
+GET /api/home?count=2
+GET /api/home?count=3
+```
+
+**返回：**
+```json
+{"ok": true, "action": "home", "count": 1}
+```
+
+### 配置
+
+API 端口通过 preferences plist 的 `ApiPort` 字段配置：
+- 不设置或设置为非零数字：使用该端口（默认 `5802`）
+- 设置为 `0`：关闭 API 服务器
+
 ## Build Dependencies
 
 See: <https://github.com/Lessica/BuildVNCServer>

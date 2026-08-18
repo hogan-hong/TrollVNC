@@ -121,6 +121,9 @@ static char *gSslKeyPath = NULL;
 // Bonjour / mDNS Auto-Discovery
 static BOOL gBonjourEnabled = YES; // publish _rfb._tcp (and optional _http._tcp)
 
+// HTTP API 服务器（辅助触控开关、退出引导访问等）
+static int gApiPort = 5802; // 默认 API 端口（0 = 关闭）
+
 // TightVNC 1.x file transfer extension (deprecated)
 static BOOL gFileTransferEnabled = NO;
 
@@ -348,6 +351,10 @@ static void printUsageAndExit(const char *prog) {
     fprintf(stderr, "Extensions:\n");
     fprintf(stderr, "  -C on|off  Clipboard sync (default: on)\n");
     fprintf(stderr, "  -T on|off  File transfer (default: off)\n\n");
+
+    fprintf(stderr, "HTTP API (port 5802 by default):\n");
+    fprintf(stderr, "  Configure via 'ApiPort' in preferences plist (0=disabled).\n");
+    fprintf(stderr, "  Endpoints: /api/health, /api/assistivetouch, /api/guidedaccess/exit, /api/home\n\n");
 
 #if DEBUG
     fprintf(stderr, "Logging:\n");
@@ -639,6 +646,20 @@ static void parseDaemonOptions(void) {
         }
     }
 
+    // API 端口
+    NSNumber *apiPortN = [prefs objectForKey:@"ApiPort"];
+    if ([apiPortN isKindOfClass:[NSNumber class]] || [apiPortN isKindOfClass:[NSString class]]) {
+        int v = apiPortN.intValue;
+        if (v == 0) {
+            gApiPort = 0; // disabled
+        } else if (v < 0 || v > 65535 || v < 1024) {
+            TVLog(@"-daemon: invalid API Port=%d; using default 5802", v);
+            gApiPort = 5802;
+        } else {
+            gApiPort = v;
+        }
+    }
+
     // Booleans
     NSNumber *enableN = [prefs objectForKey:@"Enabled"];
     if ([enableN isKindOfClass:[NSNumber class]])
@@ -895,7 +916,7 @@ static void parseDaemonOptions(void) {
     NSMutableString *cfg = [NSMutableString stringWithFormat:@"-daemon: cfg "];
     [cfg appendFormat:@"name='%@' ", gDesktopName];
     [cfg appendFormat:@"bindHost='%@' ", gBindHost];
-    [cfg appendFormat:@"port=%d http=%d ", gPort, gHttpPort];
+    [cfg appendFormat:@"port=%d http=%d api=%d ", gPort, gHttpPort, gApiPort];
 
     // Reverse connection summary
     const char *revModeStr = isRepeaterEnabled() ? (gRepeaterMode == 2 ? "repeater" : "viewer") : "off";
@@ -3462,6 +3483,244 @@ static void startBonjour(void) {
     }
 }
 
+#pragma mark - HTTP API Server
+
+// 前向声明（tvSetNonBlocking 定义在 Control Socket 区域）
+static int tvSetNonBlocking(int fd);
+
+// 发送 JSON HTTP 响应
+static void tvApiSendJson(int fd, int statusCode, NSDictionary *json) {
+    NSString *codeStr = [NSString stringWithFormat:@"%d", statusCode];
+    NSString *body = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:json options:0 error:nil]
+                                           encoding:NSUTF8StringEncoding];
+    NSString *response = [NSString stringWithFormat:
+        @"HTTP/1.1 %@ %@\r\n"
+         "Content-Type: application/json; charset=utf-8\r\n"
+         "Content-Length: %lu\r\n"
+         "Connection: close\r\n"
+         "Access-Control-Allow-Origin: *\r\n"
+         "\r\n"
+         "%@",
+         codeStr,
+         (statusCode == 200) ? @"OK" : (statusCode == 400 ? @"Bad Request" : @"Not Found"),
+         (unsigned long)[body lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
+         body];
+    const char *cstr = [response UTF8String];
+    size_t total = strlen(cstr);
+    ssize_t sent = 0;
+    while ((size_t)sent < total) {
+        ssize_t n = write(fd, cstr + sent, total - sent);
+        if (n <= 0) break;
+        sent += n;
+    }
+}
+
+// 解析查询字符串为字典
+static NSDictionary *tvApiParseQuery(NSString *queryStr) {
+    NSMutableDictionary *params = [NSMutableDictionary dictionary];
+    if (queryStr.length == 0) return params;
+    NSArray *pairs = [queryStr componentsSeparatedByString:@"&"];
+    for (NSString *pair in pairs) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location != NSNotFound) {
+            NSString *key = [pair substringToIndex:eq.location];
+            NSString *val = [pair substringFromIndex:eq.location + 1];
+            val = [val stringByReplacingOccurrencesOfString:@"+" withString:@" "];
+            val = [val stringByRemovingPercentEncoding];
+            params[key] = val;
+        }
+    }
+    return params;
+}
+
+// 辅助触控开关（使用 PSAssistiveTouchSettingsDetail 系统API）
+static BOOL tvSetAssistiveTouch(BOOL enable) {
+    [PSAssistiveTouchSettingsDetail setEnabled:enable];
+    BOOL nowEnabled = [PSAssistiveTouchSettingsDetail isEnabled];
+    TVLog(@"API: 辅助触控 setEnabled:%@ -> isEnabled:%@", enable ? @"YES" : @"NO", nowEnabled ? @"YES" : @"NO");
+    return (nowEnabled == enable);
+}
+
+// 退出引导访问（三击 Home 键调出退出界面，用户手动输入密码）
+static void tvExitGuidedAccess(void) {
+    STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+    [gen menuTriplePress];
+    TVLog(@"API: 退出引导访问已执行三击Home");
+}
+
+// HTTP API 请求处理
+static void tvApiHandleConnection(int cfd, struct sockaddr_in caddr) {
+    @autoreleasepool {
+        // 设置接收超时 5 秒
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // 读取 HTTP 请求
+        char buf[4096];
+        ssize_t n = recv(cfd, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) {
+            close(cfd);
+            return;
+        }
+        buf[n] = '\0';
+
+        NSString *request = [NSString stringWithUTF8String:buf];
+
+        // 解析请求行: GET /api/... HTTP/1.1
+        NSRange firstSpace = [request rangeOfString:@" "];
+        if (firstSpace.location == NSNotFound) {
+            tvApiSendJson(cfd, 400, @{@"ok": @NO, @"error": @"Invalid request"});
+            close(cfd);
+            return;
+        }
+
+        NSString *method = [request substringToIndex:firstSpace.location];
+        NSString *rest = [request substringFromIndex:firstSpace.location + 1];
+
+        NSRange secondSpace = [rest rangeOfString:@" "];
+        if (secondSpace.location == NSNotFound) {
+            tvApiSendJson(cfd, 400, @{@"ok": @NO, @"error": @"Invalid request line"});
+            close(cfd);
+            return;
+        }
+
+        NSString *fullPath = [rest substringToIndex:secondSpace.location];
+
+        // 分离路径和查询字符串
+        NSString *path = fullPath;
+        NSString *queryStr = @"";
+        NSRange qRange = [fullPath rangeOfString:@"?"];
+        if (qRange.location != NSNotFound) {
+            path = [fullPath substringToIndex:qRange.location];
+            queryStr = [fullPath substringFromIndex:qRange.location + 1];
+        }
+
+        NSDictionary *query = tvApiParseQuery(queryStr);
+
+        char ipBuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &caddr.sin_addr, ipBuf, sizeof(ipBuf));
+        TVLog(@"API: %@ %@ from %s:%d", method, fullPath, ipBuf, ntohs(caddr.sin_port));
+
+        // 只支持 GET
+        if (![method isEqualToString:@"GET"]) {
+            tvApiSendJson(cfd, 404, @{@"ok": @NO, @"error": @"Only GET supported"});
+            close(cfd);
+            return;
+        }
+
+        // 路由
+        if ([path isEqualToString:@"/api/health"]) {
+            tvApiSendJson(cfd, 200, @{@"ok": @YES, @"status": @"running"});
+
+        } else if ([path isEqualToString:@"/api/assistivetouch"]) {
+            BOOL enable = YES;
+            NSString *enableStr = query[@"enable"];
+            if (enableStr && [enableStr.lowercaseString isEqualToString:@"false"]) {
+                enable = NO;
+            }
+            BOOL ok = tvSetAssistiveTouch(enable);
+            tvApiSendJson(cfd, ok ? 200 : 500, @{
+                @"ok": @(ok),
+                @"action": enable ? @"enable" : @"disable",
+                @"feature": @"AssistiveTouch"
+            });
+
+        } else if ([path isEqualToString:@"/api/guidedaccess/exit"]) {
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                tvExitGuidedAccess();
+            });
+            tvApiSendJson(cfd, 200, @{
+                @"ok": @YES,
+                @"action": @"exit_guided_access"
+            });
+
+        } else if ([path isEqualToString:@"/api/home"]) {
+            STHIDEventGenerator *gen = [STHIDEventGenerator sharedGenerator];
+            NSString *countStr = query[@"count"];
+            int count = countStr ? countStr.intValue : 1;
+
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                if (count >= 3) {
+                    [gen menuTriplePress];
+                } else if (count == 2) {
+                    [gen menuDoublePress];
+                } else {
+                    [gen menuPress];
+                }
+            });
+            tvApiSendJson(cfd, 200, @{
+                @"ok": @YES,
+                @"action": @"home",
+                @"count": @(count)
+            });
+
+        } else {
+            tvApiSendJson(cfd, 404, @{@"ok": @NO, @"error": @"Unknown endpoint"});
+        }
+
+        close(cfd);
+    }
+}
+
+static dispatch_source_t gApiAcceptSource = NULL;
+
+static void tvStartApiServerIfNeeded(void) {
+    if (!gApiPort)
+        return;
+    if (gApiAcceptSource)
+        return;
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        TVPrintError("API server: socket() failed: %s", strerror(errno));
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_len = sizeof(addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)gApiPort);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        TVPrintError("API server: bind 0.0.0.0:%d failed: %s", gApiPort, strerror(errno));
+        close(fd);
+        return;
+    }
+
+    if (listen(fd, 8) < 0) {
+        TVPrintError("API server: listen() failed: %s", strerror(errno));
+        close(fd);
+        return;
+    }
+
+    // 设为非阻塞
+    tvSetNonBlocking(fd);
+
+    gApiAcceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, fd, 0, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
+    dispatch_source_set_event_handler(gApiAcceptSource, ^{
+        while (1) {
+            struct sockaddr_in caddr;
+            socklen_t clen = sizeof(caddr);
+            int cfd = accept(fd, (struct sockaddr *)&caddr, &clen);
+            if (cfd < 0) break;
+            tvApiHandleConnection(cfd, caddr);
+        }
+    });
+    dispatch_resume(gApiAcceptSource);
+
+    TVLog(@"API server: listening on 0.0.0.0:%d", gApiPort);
+}
+
 #pragma mark - Control Socket
 
 static int gTvCtlListenFd = -1;
@@ -4846,6 +5105,9 @@ static void initializeAndRunRfbServer(void) {
 
     // Start Bonjour advertisement after server is ready
     startBonjour();
+
+    // Start HTTP API server
+    tvStartApiServerIfNeeded();
 }
 
 static void handleSignal(int signum) {

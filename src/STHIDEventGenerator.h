@@ -196,6 +196,9 @@ __used NS_INLINE void STAccurateSleep(NSTimeInterval seconds) {
 // sync 0.05 + 0.15 + 0.05 = 0.25
 - (void)menuDoublePress;
 
+// sync 0.05 + 0.15 + 0.05 + 0.15 + 0.05 + 0.15 + 0.05 = 0.65
+- (void)menuTriplePress;
+
 // async 2.0
 - (void)menuLongPress;
 

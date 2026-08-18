@@ -1354,6 +1354,32 @@ static inline uint32_t hidUsageCodeForCharacter(NSString *key) {
     [self sendMarkerHIDEvent];
 }
 
+- (void)menuTriplePress {
+    struct timespec doubleDelay = {0, (long)(multiTapInterval * nanosecondsPerSecond)};
+    struct timespec pressDelay = {0, (long)(fingerLiftDelay * nanosecondsPerSecond)};
+
+    // 第一次
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
+    nanosleep(&pressDelay, 0);
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:false];
+
+    nanosleep(&doubleDelay, 0);
+
+    // 第二次
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
+    nanosleep(&pressDelay, 0);
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:false];
+
+    nanosleep(&doubleDelay, 0);
+
+    // 第三次
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:true];
+    nanosleep(&pressDelay, 0);
+    [self _sendIOHIDKeyboardEvent:kHIDPage_Consumer usage:kHIDUsage_Csmr_Menu isKeyDown:false];
+
+    [self sendMarkerHIDEvent];
+}
+
 - (void)menuLongPress {
     struct timespec longPressDelay = {0, (long)(longPressHoldDelay * nanosecondsPerSecond)};
 
