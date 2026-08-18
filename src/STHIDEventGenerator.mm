@@ -539,19 +539,64 @@ static InterpolationType interpolationFromString(NSString *string) {
     return eventRef;
 }
 
+// === HID 诊断日志 ===
+// 日志路径: /var/trollvnc-hid.log
+// 记录 IOHIDEventSystemClientCreate 返回值和 DispatchEvent 执行情况
+// 用于诊断无屏冷启动时触控失效问题
+static NSString *const kHIDLogPath = @"/var/trollvnc-hid.log";
+static const NSUInteger kHIDLogMaxSize = 2 * 1024 * 1024; // 2MB 上限
+
+static void _hidLog(NSString *message) {
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t fmtToken;
+    dispatch_once(&fmtToken, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    });
+    NSString *timestamp = [fmt stringFromDate:[NSDate date]];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kHIDLogPath]) {
+        [@"TrollVNC HID 诊断日志\n" writeToFile:kHIDLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSDictionary *attrs = [fm attributesOfItemAtPath:kHIDLogPath error:nil];
+    if (attrs && [attrs[NSFileSize] unsignedLongLongValue] > kHIDLogMaxSize) {
+        [@"TrollVNC HID 诊断日志 (已截断)\n" writeToFile:kHIDLogPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:kHIDLogPath];
+    if (handle) {
+        [handle seekToEndOfFile];
+        [handle writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+    }
+    fprintf(stderr, "%s", [line UTF8String]);
+}
+
 static void _sendHIDEvent(IOHIDEventRef eventRef, dispatch_queue_t queue) {
     static IOHIDEventSystemClientRef _ioSystemClient = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+
+    // 去掉 dispatch_once，改为 nil 时自动重建
+    // 参考 Veency (saurik) 原版: if (client_ == NULL) client_ = IOHIDEventSystemClientCreate(...)
+    // 原因: 无屏冷启动时 backboardd HID 管线可能未就绪，dispatch_once 只试一次会永久失败
+    if (_ioSystemClient == nil) {
         @autoreleasepool {
             _ioSystemClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+            _hidLog([NSString stringWithFormat:@"IOHIDEventSystemClientCreate -> %p", _ioSystemClient]);
         }
-    });
+    }
+
     if (eventRef) {
         IOHIDEventRef strongEvent = (IOHIDEventRef)CFRetain(eventRef);
         dispatch_async(queue, ^{
             IOHIDEventSetSenderID(strongEvent, 0x8000000817319372);
-            IOHIDEventSystemClientDispatchEvent(_ioSystemClient, strongEvent);
+
+            if (_ioSystemClient == nil) {
+                _hidLog(@"DispatchEvent 跳过: client 为 nil (IOHIDEventSystemClientCreate 失败)");
+            } else {
+                IOHIDEventSystemClientDispatchEvent(_ioSystemClient, strongEvent);
+                _hidLog([NSString stringWithFormat:@"DispatchEvent 已执行: client=%p event=%p", _ioSystemClient, strongEvent]);
+            }
 
             CFRelease(strongEvent);
         });
